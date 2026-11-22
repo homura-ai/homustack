@@ -96,6 +96,45 @@ def fable_excluded_accounts():
     return result
 
 
+LIMIT_REASONS = ('quota', 'credential_quota')
+LIMIT_ERRORS = ('usage_limit_reached', 'rate_limit_error')
+
+
+def limit_evidence(entry):
+    """Provider usage-limit evidence from the proxy's own auth state, or None when it shows no cooldowns.
+
+    Keeps only the error type, the rejected rate-limit windows per model with
+    their reset times, and the quota cooldowns; the raw error text never leaves this function.
+    """
+    if not isinstance(entry.get('cooldowns'), list):
+        return None
+    errors = set()
+    try:
+        message = json.loads(entry.get('status_message') or '')
+        for error in (message.get('error'), message, (message.get('body') or {}).get('error')):
+            if isinstance(error, dict):
+                errors.add(str(error.get('type', '')).strip().lower())
+    except (ValueError, TypeError, AttributeError):
+        pass
+    rejected = {}
+    for model, quota in (entry.get('model_quotas') or {}).items():
+        signals = (quota.get('signals') or {}) if isinstance(quota, dict) else {}
+        # A window without its own Reset ends when the same response's Retry-After does
+        # (the proxy replaces a model's signals as one snapshot per response).
+        observed, retry = observation_time(quota.get('observed_at') if isinstance(quota, dict) else None), number(signals.get('Retry-After'))
+        fallback = observed + retry if observed is not None and retry is not None else None
+        windows = {('any' if key == PREFIX + 'Status' else key[len(PREFIX):-len('-Status')]):
+                   number(signals.get(key[:-len('Status')] + 'Reset')) or fallback
+                   for key, value in signals.items()
+                   if key.startswith(PREFIX) and key.endswith('Status') and value == 'rejected'}
+        if windows:
+            rejected[model] = windows
+    cooldowns = [dict(scope=c.get('scope'), model=c.get('model_key'), retry_at=observation_time(c.get('retry_at')))
+                 for c in entry['cooldowns'] if isinstance(c, dict) and c.get('reason') in LIMIT_REASONS]
+    return dict(unavailable=entry.get('unavailable') is True, errors=sorted(errors & set(LIMIT_ERRORS)),
+                rejected=rejected, cooldowns=cooldowns)
+
+
 def parse(data, excluded_accounts=None):
     """-> account rows with safe identity/status fields and independent usage meters."""
     files = data if isinstance(data, list) else data.get('files', [])
@@ -142,7 +181,7 @@ def parse(data, excluded_accounts=None):
                             for rule in (f.get('excluded_models') or []))),
                         fable_no_traffic=f.get('fable_no_traffic') is True,
                         observed_at=observation_time(quota.get('observed_at')),
-                        fable_observed_at=fable_time))
+                        fable_observed_at=fable_time, limit=limit_evidence(f)))
     return out
 
 
@@ -189,7 +228,7 @@ def parse_codex(data, checked_at=None):
                    plan=sig.get(CODEX + 'Plan-Type'), retry=f.get('next_retry_after'),
                    u5=None, r5=None, u7=None, r7=None, exposed=any(k.startswith(CODEX) for k in sig),
                    observed_at=observation_time((f.get('quota') or {}).get('observed_at')),
-                   availability=codex_availability(f, checked_at))
+                   availability=codex_availability(f, checked_at), limit=limit_evidence(f))
         pu, pr, window = num('Primary-Used-Percent'), num('Primary-Reset-At'), num('Primary-Window-Minutes')
         su, sr = num('Secondary-Used-Percent'), num('Secondary-Reset-At')
         if pu is not None:

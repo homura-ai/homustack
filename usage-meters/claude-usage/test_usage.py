@@ -65,6 +65,36 @@ class Tests(unittest.TestCase):
         self.resets_patch.start()
         self.addCleanup(self.resets_patch.stop)
 
+    def test_limit_evidence_from_proxy_auth_state(self):
+        claude = dict(provider='claude', email='a@x', status='error', unavailable=True,
+                      status_message=json.dumps(dict(type='error', error=dict(type='rate_limit_error', message='secret text'))),
+                      cooldowns=[dict(scope='model', model_key='claude-opus-5-5', reason='quota',
+                                      retry_at='2026-11-24T09:00:22Z', http_status=429),
+                                 dict(scope='model', model_key='claude-sonnet-5-5', reason='transient',
+                                      retry_at='2026-11-24T09:00:22Z')],
+                      model_quotas={'claude-opus-5-5': dict(signals={cu.PREFIX + 'Status': 'rejected',
+                                                                     cu.PREFIX + '7d-Status': 'rejected',
+                                                                     cu.PREFIX + '7d-Reset': '1795510800',
+                                                                     cu.PREFIX + '5h-Status': 'allowed',
+                                                                     cu.PREFIX + '7d_sonnet-Status': 'rejected'})})
+        [row] = cu.parse([claude], excluded_accounts=set())
+        self.assertEqual(row['limit'], dict(unavailable=True, errors=['rate_limit_error'],
+                                            rejected={'claude-opus-5-5': {'any': None, '7d': 1795510800., '7d_sonnet': None}},
+                                            cooldowns=[dict(scope='model', model='claude-opus-5-5',
+                                                            retry_at=cu.observation_time('2026-11-24T09:00:22Z'))]))
+        self.assertNotIn('secret text', json.dumps(row))
+        fable = dict(claude, model_quotas={'claude-fable-5-2': dict(observed_at='2026-11-21T23:00:00Z', signals={
+            cu.PREFIX + '7d_oi-Status': 'rejected', 'Retry-After': '120'})})
+        [row] = cu.parse([fable], excluded_accounts=set())
+        self.assertEqual(row['limit']['rejected'], {'claude-fable-5-2': {'7d_oi': cu.observation_time('2026-11-21T23:00:00Z') + 120}})
+        codex = dict(provider='codex', email='c@x', status='error', unavailable=True,
+                     status_message=json.dumps(dict(error=dict(type='usage_limit_reached'))),
+                     cooldowns=[dict(scope='credential', reason='credential_quota', retry_at='2026-11-23T23:19:19Z')])
+        [row] = cu.parse_codex([codex], checked_at=0)
+        self.assertEqual((row['limit']['errors'], row['limit']['cooldowns'][0]['scope']), (['usage_limit_reached'], 'credential'))
+        [old] = cu.parse_codex([dict(provider='codex', email='d@x', status='active')], checked_at=0)
+        self.assertIsNone(old['limit'])  # a proxy without a cooldown view proves nothing
+
     def test_parse_and_render(self):
         rows = cu.parse(DATA)
         self.assertEqual([r['email'] for r in rows], ['a@x', 'b@x'])
