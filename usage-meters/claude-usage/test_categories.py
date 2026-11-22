@@ -523,18 +523,27 @@ class Categories(unittest.TestCase):
             self.assertEqual(b.cli(self.host, args, lambda: datetime.fromtimestamp(self.now, cu.ET)), 0)
             self.assertTrue(passive.called)
 
+    @staticmethod
+    def limit(errors=(), cooldowns=(), rejected=None, unavailable=None):
+        cooldowns = [dict(scope=scope, model=model, retry_at=retry) for scope, model, retry in cooldowns]
+        return dict(unavailable=bool(cooldowns) if unavailable is None else unavailable,
+                    errors=list(errors), rejected=rejected or {}, cooldowns=cooldowns)
+
     def test_recovery_category_transitions_debounced_and_category_only(self):
         rows = copy.deepcopy(self.rows)
+        for r in rows:
+            r['limit'] = self.limit()
         codex = [r for r in rows if r['provider'] == 'codex']
         self.assertTrue(codex)
+        dead = lambda retry: self.limit(['usage_limit_reached'], [('credential', None, retry)])
         status = lambda: b.category_status(self.policy, rows, self.now)
         run = lambda: b.recovery_transitions(self.host, status(), self.now)
         self.assertEqual(run(), [])  # silent baseline
-        codex[0]['u7'] = 1.0; codex[0]['r7'] = self.now + 3600
+        codex[0]['limit'] = dead(self.now + 3600)
         self.assertEqual(run(), [])  # one account out: no category transition
         for r in codex:
-            r['u7'] = 1.0; r['r7'] = self.now + 7200
-        codex[0]['r7'] = self.now + 3600
+            r['limit'] = dead(self.now + 7200)
+        codex[0]['limit'] = dead(self.now + 3600)
         self.assertEqual(run(), [])  # first sighting is unconfirmed
         [hit] = run()
         self.assertEqual((hit['category'], hit['transition'], hit['earliest_return']),
@@ -542,7 +551,7 @@ class Categories(unittest.TestCase):
         self.assertEqual(run(), [])  # steady state never re-fires
         self.assertEqual(b.recovery_transitions(self.host, {'codex': (None, None)}, self.now), [])  # unreadable is not "back"
         self.assertEqual(run(), [])
-        codex[0]['r7'] = self.now - 1  # cached 100% whose reset time has passed is stale
+        codex[0]['limit'] = self.limit()  # provider reset: the proxy cleared the cooldown
         self.assertEqual(run(), [])
         [back] = run()
         self.assertEqual((back['category'], back['transition']), ('codex', 'available-again'))
@@ -550,6 +559,54 @@ class Categories(unittest.TestCase):
         self.assertEqual([json.loads(l)['id'] for l in lines], [hit['id'], back['id']])
         self.assertNotIn('@', ''.join(lines))  # no individual account in the event
         self.assertEqual(oct((self.root / 'recovery-category-events.jsonl').stat().st_mode & 0o777), '0o600')
+
+    def test_full_meters_without_limit_errors_are_not_out(self):
+        rows = copy.deepcopy(self.rows)
+        for r in rows:
+            r.update(u7=1.0, uf=1.0, r7=self.now + 3600, rf=self.now + 3600, limit=self.limit())
+        status = b.category_status(self.policy, rows, self.now)
+        self.assertEqual({c: status[c][0] for c in b.CATEGORIES}, dict.fromkeys(b.CATEGORIES, False))
+
+    def test_fable_excluded_account_does_not_veto_fable_death(self):
+        rows = copy.deepcopy(self.rows)
+        claude = [r for r in rows if r['provider'] == 'claude']
+        self.assertGreater(len(claude), 1)
+        later = self.now + 3600
+        for r in rows:
+            r['limit'] = self.limit()
+        for r in claude[1:]:
+            r['fable_excluded'] = True
+        claude[0]['limit'] = self.limit([], [('model', 'claude-fable-5-2', later)], {'claude-fable-5-2': {'7d_oi': later}})
+        self.assertEqual(b.category_status(self.policy, rows, self.now)['fable'], (True, later))
+        claude[1]['fable_excluded'] = False
+        self.assertEqual(b.category_status(self.policy, rows, self.now)['fable'], (False, None))
+
+    def test_account_limit_requires_error_cooldown_and_category_scope(self):
+        codex, claude = dict(provider='codex'), dict(provider='claude')
+        later = self.now + 3600
+        account = lambda row, category, limit: b.account_limit(dict(row, limit=limit), category, self.now)
+        usage = ['usage_limit_reached']
+        self.assertEqual(account(codex, 'codex', self.limit(usage, [('credential', None, later)])), (True, later))
+        self.assertFalse(account(codex, 'codex', self.limit(usage, [('credential', None, self.now - 1)]))[0])  # expired
+        self.assertFalse(account(codex, 'codex', self.limit(usage, [('model', 'gpt-6.2-sol', later)]))[0])  # one model
+        self.assertFalse(account(codex, 'codex', self.limit([], [('credential', None, later)]))[0])  # no limit error
+        self.assertFalse(account(codex, 'codex', self.limit(usage, [('model', 'gpt-6.2-sol', later)], {'gpt-6.2-sol': dict(any=later)}))[0])
+        self.assertFalse(account(codex, 'codex', self.limit(usage, [('credential', None, later)], unavailable=False))[0])
+        rate = ['rate_limit_error']
+        opus = self.limit(rate, [('model', 'claude-opus-5-5', later)], {'claude-opus-5-5': dict(any=later, **{'7d': later})})
+        self.assertEqual(account(claude, 'non-fable', opus), (True, later))
+        self.assertFalse(account(claude, 'fable', opus)[0])  # an Opus cooldown is not a Fable death
+        five_hour = self.limit(rate, [('model', 'claude-opus-5-5', later)], {'claude-opus-5-5': dict(any=later, **{'5h': later})})
+        self.assertFalse(account(claude, 'non-fable', five_hour)[0])  # only the shared 7-day window counts
+        stale = self.limit([], [('model', 'claude-opus-5-5', later)], {'claude-opus-5-5': {'7d': self.now - 1}})
+        self.assertFalse(account(claude, 'non-fable', stale)[0])  # kept headers from a window that already reset
+        fable = self.limit(rate, [('model', 'claude-fable-5-2', later)], {'claude-fable-5-2': dict(any=later, **{'7d_oi': later})})
+        self.assertEqual(account(claude, 'fable', fable), (True, later))
+        partial = self.limit([], [('model', 'claude-fable-5-2', later)], {'claude-fable-5-2': {'7d_oi': later}}, unavailable=False)
+        self.assertEqual(account(claude, 'fable', partial), (True, later))  # other models still run: no account error
+        self.assertFalse(account(claude, 'fable', self.limit([], [('model', 'claude-fable-5-2', later)]))[0])  # not rejected
+        self.assertFalse(account(claude, 'non-fable', fable)[0])
+        self.assertEqual(b.account_limit(claude, 'fable', self.now), (None, None))
 
     def test_notice_thread_unset_sends_nothing(self):
         self.addCleanup(setattr, b, 'NOTICE_THREAD', b.NOTICE_THREAD)
@@ -668,8 +725,7 @@ class Categories(unittest.TestCase):
         self.assertIsNone(b.category_status(self.policy, rows, self.now)['codex'][0])
         blank = copy.deepcopy(self.rows)
         for r in blank:
-            if r['provider'] == 'codex':
-                r.update(u5=None, u7=None)  # row present, meter signals missing
+            r['limit'] = None if r['provider'] == 'codex' else self.limit()  # row present, no cooldown view
         self.assertIsNone(b.category_status(self.policy, blank, self.now)['codex'][0])
 
     def test_account_and_fraction_alerts_never_wake_notification_thread(self):

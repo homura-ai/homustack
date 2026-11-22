@@ -157,6 +157,7 @@ def observe(ledger, rows, now, policy):
         if previous and now <= previous['time']:
             continue
         row = dict(row)
+        row.pop('limit', None)  # category status reads fresh rows; the ledger keeps meters only
         # A missing model-specific Fable snapshot must not hide account-wide
         # non-Fable consumption. Hold HISTORICAL Fable spend constant, rather
         # than setting its cumulative gauge to zero and charging it again.
@@ -1064,7 +1065,6 @@ def account_events(host, rows, items, ledger, now):
     return []
 
 
-GAUGE_RESET = {'fable': 'rf', 'non-fable': 'r7', 'codex': 'r7'}
 RECOVERY_CONFIRM = 2  # consecutive same readings (meter check runs every 60 s) before a transition
 
 
@@ -1076,38 +1076,63 @@ def _epoch(value):
     return value if math.isfinite(value) else None
 
 
+def account_limit(row, category, now):
+    """-> (out, return) for one account in one category from provider usage-limit errors.
+
+    Out means the proxy holds the account in an active quota cooldown after a
+    provider usage-limit error. A whole-credential cooldown counts when the account
+    is unavailable with the provider's limit error (Codex `usage_limit_reached`,
+    Claude `rate_limit_error`). A Claude model cooldown in this category counts when
+    the provider rejected that model's window and it has not reset yet (the shared
+    7-day window for non-Fable models); the proxy clears the account error while other models still run, so it
+    is not required there. A meter at 100% alone is not out. Return is when the last
+    of those cooldowns ends. (None, None) when the row has no cooldown view.
+    """
+    limit = row.get('limit')
+    if not isinstance(limit, dict):
+        return None, None
+    codex = row.get('provider', 'claude') == 'codex'
+    credential_out = limit['unavailable'] and ('usage_limit_reached' if codex else 'rate_limit_error') in limit['errors']
+    fable = category == 'fable'
+
+    def covers(c):
+        if c.get('scope') == 'credential':
+            return credential_out
+        model = str(c.get('model') or '')
+        if codex or c.get('scope') != 'model' or model.startswith('claude-fable') != fable:
+            return False
+        # The proxy keeps the last quota headers, so only a rejection whose window has not reset yet counts.
+        live = [w for w, reset in limit['rejected'].get(model, {}).items() if reset is not None and reset > now]
+        return bool(live) if fable else '7d' in live
+    ends = [c['retry_at'] for c in limit['cooldowns'] if covers(c) and c.get('retry_at') and c['retry_at'] > now]
+    return (True, max(ends)) if ends else (False, None)
+
+
 def category_status(policy, rows, now):
     """{category: (out, earliest_return)}; out is None when any source is unreadable.
 
-    A window at 100% whose reset time has passed is stale (cached proxy headers
-    are not refreshed until a request succeeds), so it no longer counts as out.
+    A category is out only when every account in it is out by account_limit().
     """
     current = {(r.get('provider', 'claude'), r['email']): r for r in rows}
     result = {}
     for category in CATEGORIES:
         relevant = [s for s in policy['sources'] if (s['provider'] == 'codex') == (category == 'codex')]
+        if category == 'fable':  # an account that never serves Fable cannot keep Fable alive
+            relevant = [s for s in relevant
+                        if (current.get((s['provider'], s['email'])) or {}).get('fable_excluded') is not True]
         out, returns = bool(relevant), []
         for source in relevant:
             row = current.get((source['provider'], source['email']))
-            if row is None:
-                out = None
+            account_out, back = (None, None) if row is None else account_limit(row, category, now)
+            if account_out is None:
+                out = None  # no cooldown evidence: unknown, never proof of availability
                 break
-            g = gauges(row).get(category)
-            windows = [(row.get('u7'), row.get('r7')), (row.get('u5'), row.get('r5')),
-                       (None if g is None else g / 100, row.get(GAUGE_RESET[category]))]
-            if all(u is None for u, _ in windows):
-                out = None  # no meter evidence: unknown, never proof of availability
-                break
-            live = [_epoch(r) for u, r in windows
-                    if u is not None and float(u) >= 1 and (_epoch(r) is None or _epoch(r) > now)]
-            if not live:
+            if not account_out:
                 out = False
             elif out is not False:
-                returns.append(None if None in live else max(live))
-        known = [r for r in returns if r is not None]
-        result[category] = (out, min(known) if out and known and len(known) == len(returns) else None)
+                returns.append(back)
+        result[category] = (out, min(returns) if out and returns else None)
     return result
-
 
 def recovery_transitions(host, status, now):
     """Append category limit-hit / available-again events for the external recovery agent.
